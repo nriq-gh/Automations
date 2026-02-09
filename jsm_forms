@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""
+Export Jira Service Management (JSM) project forms.
+
+Env vars (preferred):
+  export JIRA_BASE_URL="https://yourcompany.atlassian.net"
+  export JIRA_EMAIL="you@company.com"
+  export JIRA_API_TOKEN="xxxxxxxxxxxxxxxx"
+  export JIRA_PROJECT_KEY="HRPO"                         # optional
+  export JIRA_OUT_DIR="./forms_export"                   # optional
+  export JIRA_INCLUDE_PORTAL_MAPPING="1"                 # optional (0/1, false/true)
+  export JIRA_INCLUDE_REQUESTTYPE_FIELDS="1"             # optional (0/1, false/true)
+
+Or pass flags to override env (see --help).
+
+What it does:
+  1) Gets cloudId from <base>/_edge/tenant_info
+  2) Lists all Jira Forms on the project (project-level templates)
+  3) Downloads each form JSON definition
+  4) (Optional) Maps portal request types -> attached form (if any)
+  5) (Optional) Exports legacy request-type fields schema
+
+Notes:
+  - Read-only. Requires API token auth.
+  - Adds 'X-ExperimentalApi: opt-in' to Forms endpoints to avoid 412s.
+  - Handles pagination + basic 429/5xx backoff.
+"""
+
+import argparse
+import csv
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+from requests.auth import HTTPBasicAuth
+
+
+# ------------------ Helpers ------------------
+
+def _norm_base_url(url: str) -> str:
+    if not url:
+        return url
+    url = url.strip()
+    # ensure scheme
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    # drop trailing slash
+    if url.endswith("/"):
+        url = url[:-1]
+    return url
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def write_json(path: str, obj: Any) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+def write_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in fieldnames})
+
+def backoff_sleep(attempt: int) -> None:
+    # 1, 2, 4, 8, 16, max 30s
+    time.sleep(min(30, 2 ** max(0, attempt)))
+
+def request_json(
+    method: str,
+    url: str,
+    auth: HTTPBasicAuth,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Any] = None,
+    max_attempts: int = 6,
+) -> Tuple[int, Any, Dict[str, str]]:
+    h = {"Accept": "application/json"}
+    if headers:
+        h.update(headers)
+    attempt = 0
+    while True:
+        resp = requests.request(method, url, auth=auth, headers=h, params=params, json=json_body)
+        status = resp.status_code
+        # Retry on rate limit/server errors
+        if status in (429,) or 500 <= status < 600:
+            attempt += 1
+            if attempt >= max_attempts:
+                # best-effort JSON parse
+                try:
+                    return status, resp.json(), dict(resp.headers)
+                except Exception:
+                    return status, {"text": resp.text}, dict(resp.headers)
+            backoff_sleep(attempt)
+            continue
+        # Try to parse JSON; if not JSON, return text
+        try:
+            return status, (resp.json() if resp.text else {}), dict(resp.headers)
+        except ValueError:
+            return status, {"text": resp.text}, dict(resp.headers)
+
+
+# ------------------ API Wrappers ------------------
+
+def get_cloud_id(base_url: str, auth: HTTPBasicAuth) -> str:
+    """
+    GET {base_url}/_edge/tenant_info -> {"cloudId": "..."}
+    """
+    url = f"{base_url}/_edge/tenant_info"
+    status, data, _ = request_json("GET", url, auth)
+    if status != 200 or "cloudId" not in data:
+        raise RuntimeError(f"Failed to get cloudId ({status}): {data}")
+    return data["cloudId"]
+
+def list_project_forms(cloud_id: str, project_key: str, auth: HTTPBasicAuth) -> List[Dict[str, Any]]:
+    """
+    GET https://api.atlassian.com/jira/forms/cloud/{cloudId}/project/{projectKey}/form
+    """
+    url = f"https://api.atlassian.com/jira/forms/cloud/{cloud_id}/project/{project_key}/form"
+    status, data, _ = request_json("GET", url, auth, headers={"X-ExperimentalApi": "opt-in"})
+    if status != 200 or not isinstance(data, list):
+        raise RuntimeError(f"Failed to list project forms ({status}): {data}")
+    return data
+
+def get_form_template(cloud_id: str, project_key: str, form_id: str, auth: HTTPBasicAuth) -> Dict[str, Any]:
+    """
+    GET https://api.atlassian.com/jira/forms/cloud/{cloudId}/project/{projectKey}/form/{formId}
+    """
+    url = f"https://api.atlassian.com/jira/forms/cloud/{cloud_id}/project/{project_key}/form/{form_id}"
+    status, data, _ = request_json("GET", url, auth, headers={"X-ExperimentalApi": "opt-in"})
+    if status != 200:
+        raise RuntimeError(f"Failed to get form {form_id} ({status}): {data}")
+    return data
+
+def list_service_desks(base_url: str, auth: HTTPBasicAuth) -> List[Dict[str, Any]]:
+    """
+    GET {base_url}/rest/servicedeskapi/servicedesk  (paged)
+    """
+    out: List[Dict[str, Any]] = []
+    start = 0
+    limit = 50
+    while True:
+        url = f"{base_url}/rest/servicedeskapi/servicedesk"
+        status, data, _ = request_json("GET", url, auth, params={"start": start, "limit": limit})
+        if status != 200:
+            raise RuntimeError(f"Failed to list service desks ({status}): {data}")
+        values = data.get("values", [])
+        out.extend(values)
+        if data.get("isLastPage", True) or not values:
+            break
+        start = data.get("start", start) + data.get("limit", limit)
+    return out
+
+def get_service_desk_id_for_project(base_url: str, project_key: str, auth: HTTPBasicAuth) -> Optional[str]:
+    for sd in list_service_desks(base_url, auth):
+        if str(sd.get("projectKey")) == project_key:
+            return str(sd.get("id"))
+    return None
+
+def list_request_types(base_url: str, service_desk_id: str, auth: HTTPBasicAuth) -> List[Dict[str, Any]]:
+    """
+    GET {base_url}/rest/servicedeskapi/servicedesk/{serviceDeskId}/requesttype
+    """
+    out: List[Dict[str, Any]] = []
+    start = 0
+    limit = 50
+    while True:
+        url = f"{base_url}/rest/servicedeskapi/servicedesk/{service_desk_id}/requesttype"
+        status, data, _ = request_json("GET", url, auth, params={"start": start, "limit": limit})
+        if status != 200:
+            raise RuntimeError(f"Failed to list request types ({status}): {data}")
+        vals = data.get("values", [])
+        out.extend(vals)
+        if data.get("isLastPage", True) or not vals:
+            break
+        start = data.get("start", start) + data.get("limit", limit)
+    return out
+
+def get_request_type_fields(base_url: str, service_desk_id: str, request_type_id: str, auth: HTTPBasicAuth) -> Optional[Dict[str, Any]]:
+    """
+    GET {base_url}/rest/servicedeskapi/servicedesk/{serviceDeskId}/requesttype/{requestTypeId}/field
+    """
+    url = f"{base_url}/rest/servicedeskapi/servicedesk/{service_desk_id}/requesttype/{request_type_id}/field"
+    status, data, _ = request_json("GET", url, auth)
+    if status == 200:
+        return data
+    if status == 404:
+        return None
+    raise RuntimeError(f"Failed to get request type fields ({status}): {data}")
+
+def get_portal_form_for_request_type(cloud_id: str, service_desk_id: str, request_type_id: str, auth: HTTPBasicAuth) -> Optional[Dict[str, Any]]:
+    """
+    GET https://api.atlassian.com/jira/forms/cloud/{cloudId}/servicedesk/{serviceDeskId}/requesttype/{requestTypeId}/form
+    """
+    url = f"https://api.atlassian.com/jira/forms/cloud/{cloud_id}/servicedesk/{service_desk_id}/requesttype/{request_type_id}/form"
+    status, data, _ = request_json("GET", url, auth, headers={"X-ExperimentalApi": "opt-in"})
+    if status == 200:
+        return data
+    if status == 404:
+        return None
+    raise RuntimeError(f"Failed to get portal form (RT {request_type_id}) ({status}): {data}")
+
+
+# ------------------ Main ------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Export Jira Forms (ProForma) & optional portal mapping for a JSM project")
+    parser.add_argument("--base-url", default=_norm_base_url(os.getenv("JIRA_BASE_URL")), help="e.g., https://yourcompany.atlassian.net")
+    parser.add_argument("--email", default=os.getenv("JIRA_EMAIL"))
+    parser.add_argument("--token", default=os.getenv("JIRA_API_TOKEN"))
+    parser.add_argument("--project", default=os.getenv("JIRA_PROJECT_KEY"), help="Project key, e.g., HRPO")
+    parser.add_argument("--out", default=os.getenv("JIRA_OUT_DIR", "./forms_export"))
+    parser.add_argument("--include-portal-mapping", action="store_true", default=_env_bool("JIRA_INCLUDE_PORTAL_MAPPING", False))
+    parser.add_argument("--include-requesttype-fields", action="store_true", default=_env_bool("JIRA_INCLUDE_REQUESTTYPE_FIELDS", False))
+    args = parser.parse_args()
+
+    # Validate requireds
+    missing = [name for name, val in {
+        "JIRA_BASE_URL/--base-url": args.base_url,
+        "JIRA_EMAIL/--email": args.email,
+        "JIRA_API_TOKEN/--token": args.token,
+        "JIRA_PROJECT_KEY/--project": args.project,
+    }.items() if not val]
+    if missing:
+        print("Missing required inputs:\n  - " + "\n  - ".join(missing), file=sys.stderr)
+        parser.print_help()
+        sys.exit(2)
+
+    auth = HTTPBasicAuth(args.email, args.token)
+
+    # Output path
+    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    out_dir = os.path.join(args.out, f"{args.project}_{timestamp}")
+    ensure_dir(out_dir)
+
+    print(f"[1/5] Base URL: {args.base_url}")
+    print(f"[1/5] Resolving cloudId ...")
+    cloud_id = get_cloud_id(args.base_url, auth)
+    print(f"      cloudId: {cloud_id}")
+
+    print(f"[2/5] Listing forms on project {args.project} ...")
+    index = list_project_forms(cloud_id, args.project, auth)
+    write_json(os.path.join(out_dir, "project_forms_index.json"), index)
+
+    # CSV index
+    rows: List[Dict[str, Any]] = []
+    for e in index:
+        rows.append({
+            "id": e.get("id"),
+            "name": e.get("name"),
+            "updated": e.get("updated"),
+            "portalRequestTypeIds": ",".join(map(str, e.get("portalRequestTypeIds", []))),
+            "recommendedIssueRequestTypeIds": ",".join(map(str, e.get("recommendedIssueRequestTypeIds", []))),
+            "issueCreateIssueTypeIds": ",".join(map(str, e.get("issueCreateIssueTypeIds", []))),
+            "issueCreateRequestTypeIds": ",".join(map(str, e.get("issueCreateRequestTypeIds", []))),
+        })
+    write_csv(
+        os.path.join(out_dir, "project_forms_index.csv"),
+        rows,
+        ["id", "name", "updated", "portalRequestTypeIds", "recommendedIssueRequestTypeIds",
+         "issueCreateIssueTypeIds", "issueCreateRequestTypeIds"]
+    )
+
+    print(f"[3/5] Downloading {len(index)} form template(s) ...")
+    forms_dir = os.path.join(out_dir, "forms")
+    ensure_dir(forms_dir)
+    for i, e in enumerate(index, start=1):
+        fid = e.get("id")
+        if not fid:
+            continue
+        print(f"      ({i}/{len(index)}) form {fid}")
+        form = get_form_template(cloud_id, args.project, fid, auth)
+        write_json(os.path.join(forms_dir, f"form_{fid}.json"), form)
+
+    mapping_rows: List[Dict[str, Any]] = []
+    if args.include_portal_mapping or args.include_requesttype_fields:
+        print(f"[4/5] Finding service desk for project {args.project} ...")
+        sd_id = get_service_desk_id_for_project(args.base_url, args.project, auth)
+        if not sd_id:
+            print("      No matching service desk found (ensure this is a JSM project).")
+        else:
+            print(f"      serviceDeskId: {sd_id}")
+            print(f"[5/5] Enumerating request types ...")
+            rts = list_request_types(args.base_url, sd_id, auth)
+            print(f"      Found {len(rts)} request types.")
+
+            portal_forms_dir = os.path.join(out_dir, "portal_requesttype_forms")
+            fields_dir = os.path.join(out_dir, "requesttype_fields")
+            if args.include_portal_mapping:
+                ensure_dir(portal_forms_dir)
+            if args.include_requesttype_fields:
+                ensure_dir(fields_dir)
+
+            for i, rt in enumerate(rts, start=1):
+                rt_id = str(rt.get("id"))
+                rt_name = rt.get("name")
+                print(f"      ({i}/{len(rts)}) RT {rt_id} - {rt_name}")
+
+                attached_form_id = None
+                if args.include_portal_mapping:
+                    pf = get_portal_form_for_request_type(cloud_id, sd_id, rt_id, auth)
+                    if pf:
+                        attached_form_id = pf.get("id")
+                        write_json(os.path.join(portal_forms_dir, f"requesttype_{rt_id}_form.json"), pf)
+
+                fields_payload = None
+                if args.include_requesttype_fields:
+                    fields_payload = get_request_type_fields(args.base_url, sd_id, rt_id, auth)
+                    if fields_payload is not None:
+                        write_json(os.path.join(fields_dir, f"requesttype_{rt_id}_fields.json"), fields_payload)
+
+                mapping_rows.append({
+                    "requestTypeId": rt_id,
+                    "requestTypeName": rt_name,
+                    "hasPortalForm": "yes" if attached_form_id else "no",
+                    "portalFormId": attached_form_id or "",
+                    "fieldsJsonSaved": "yes" if fields_payload is not None else "no",
+                })
+
+    if mapping_rows:
+        write_csv(
+            os.path.join(out_dir, "portal_mapping.csv"),
+            mapping_rows,
+            ["requestTypeId", "requestTypeName", "hasPortalForm", "portalFormId", "fieldsJsonSaved"]
+        )
+
+    print("\nDone.")
+    print(f"Output → {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
